@@ -1,0 +1,60 @@
+name: NCCL header removal validation
+on:
+  push:
+    branches: [validation/nvidia-395-2803-20260910]
+    paths: [.github/workflows/nccl-header-validation.yml]
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the affected revision and remove the unused include
+        run: |
+          git clone --quiet https://github.com/NVIDIA/nccl-tests.git source
+          git -C source checkout --quiet b4d5beebca8a76cf01335f724d154b9b9d394d96
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('source/src/comm_ops.cu')
+          text = path.read_text()
+          assert text.count('curand') == 1
+          assert text.count('#include <curand.h>\n') == 1
+          path.write_text(text.replace('#include <curand.h>\n', ''))
+          PY
+      - name: Install the real CUDA, CCCL, NCCL, and MPI headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libopenmpi-dev
+          python3 -m venv deps
+          deps/bin/pip -q install nvidia-cuda-runtime-cu12 nvidia-cuda-nvcc-cu12 nvidia-cuda-cccl-cu12 nvidia-nccl-cu12
+          deps/bin/pip list
+      - name: Compile both modes with cuRAND forbidden
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/no-curand artifacts
+          printf '#error unexpected cuRAND dependency\n' > /tmp/no-curand/curand.h
+          site=$(deps/bin/python -c 'import site; print(site.getsitepackages()[0])')
+          target=$(find "$site/nvidia" -path '*/nv/target' -print -quit)
+          test -n "$target"
+          cccl_include=${target%/nv/target}
+          g++ -std=c++17 -I/tmp/no-curand -x c++ source/src/comm_ops.cu -o /tmp/comm_ops_no_mpi
+          set +e
+          /tmp/comm_ops_no_mpi > artifacts/non-mpi.txt
+          rc=$?
+          set -e
+          test "$rc" = 1
+          grep -Fx 'This test requires MPI support, but was compiled without it.' artifacts/non-mpi.txt
+          # NVCC implicitly includes the CUDA runtime header for .cu translation units.
+          mpicxx -std=c++17 -DMPI_SUPPORT -I/tmp/no-curand -I"$site/nvidia/cuda_runtime/include" -I"$site/nvidia/cuda_nvcc/include" -I"$site/nvidia/nccl/include" -I"$cccl_include" -include cuda_runtime.h -x c++ -c source/src/comm_ops.cu -o /tmp/comm_ops_mpi.o
+          printf 'MPI-enabled host compilation passed with real CUDA/NCCL/MPI headers and cuRAND forbidden.\n' | tee artifacts/mpi.txt
+          git -C source diff --check
+          git -C source diff > artifacts/nccl-tests-395.patch
+          cp source/src/comm_ops.cu artifacts/comm_ops.cu
+          git -C source hash-object src/comm_ops.cu | tee artifacts/blob-sha.txt
+          git -C source rev-parse HEAD > artifacts/base-sha.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nccl-tests-395-validated
+          path: artifacts/
+          retention-days: 7
