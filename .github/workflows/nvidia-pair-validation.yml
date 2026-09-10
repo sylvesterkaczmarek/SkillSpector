@@ -1,0 +1,149 @@
+name: NVIDIA build fix validation
+on:
+  push:
+    branches: [validation/nvidia-395-2803-20260910]
+    paths: [.github/workflows/nvidia-pair-validation.yml]
+permissions:
+  contents: read
+jobs:
+  nccl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Reproduce missing cuRAND header and verify the fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/NVIDIA/nccl-tests.git source
+          cd source
+          git checkout --quiet b4d5beebca8a76cf01335f724d154b9b9d394d96
+          git rev-parse HEAD
+          git grep -n curand
+          mkdir -p /tmp/no-curand
+          printf '#error cuRAND is not a dependency of this benchmark\n' > /tmp/no-curand/curand.h
+          if g++ -std=c++17 -I/tmp/no-curand -x c++ src/comm_ops.cu -o /tmp/baseline > /tmp/baseline.log 2>&1; then
+            echo 'Unexpected baseline success'; exit 1
+          fi
+          grep 'cuRAND is not a dependency' /tmp/baseline.log
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/comm_ops.cu')
+          source = p.read_text()
+          assert source.count('#include <curand.h>\n') == 1
+          assert source.count('curand') == 1
+          p.write_text(source.replace('#include <curand.h>\n', ''))
+          PY
+          g++ -std=c++17 -I/tmp/no-curand -x c++ src/comm_ops.cu -o /tmp/comm_ops_no_mpi
+          set +e
+          /tmp/comm_ops_no_mpi > /tmp/no-mpi.log
+          rc=$?
+          set -e
+          test "$rc" = 1
+          grep -Fx 'This test requires MPI support, but was compiled without it.' /tmp/no-mpi.log
+          git diff --check
+          git diff
+      - name: Compile the MPI-enabled implementation with real dependency headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libopenmpi-dev
+          python3 -m venv deps
+          deps/bin/pip -q install nvidia-cuda-runtime-cu12 nvidia-cuda-nvcc-cu12 nvidia-nccl-cu12
+          deps/bin/pip list
+          site=$(deps/bin/python -c 'import site; print(site.getsitepackages()[0])')
+          mpicxx -std=c++17 -DMPI_SUPPORT -I/tmp/no-curand -I"$site/nvidia/cuda_runtime/include" -I"$site/nvidia/cuda_nvcc/include" -I"$site/nvidia/nccl/include" -x c++ -c source/src/comm_ops.cu -o /tmp/comm_ops_mpi.o
+          echo 'MPI-enabled C++ compilation passed with cuRAND forbidden'
+  numpy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply the scoped nightly change
+        shell: bash
+        run: |
+          git clone --quiet https://github.com/NVIDIA/cuda-python.git source
+          cd source
+          git checkout --quiet 53d74520ccdf3f842dfd7e2bdec6bc4328af06ed
+          git rev-parse HEAD
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('ci/tools/run-tests')
+          source = p.read_text()
+          Path('../run-tests-original').write_text(source)
+          comment = '      # numpy<2.5: numba-cuda-mlir 0.4.0 registers np.row_stack, which was\n      # removed in NumPy 2.5. See NVIDIA/numba-cuda-mlir#154.\n'
+          pin = '        "numpy<2.5"\n'
+          assert source.count(comment) == 1 and source.count(pin) == 1
+          p.write_text(source.replace(comment, '').replace(pin, ''))
+          PY
+          bash -n ci/tools/run-tests
+          git diff --check
+          git diff
+      - name: Compare actual install arguments across all optional nightly modes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import itertools, json, os, pathlib, subprocess, tempfile
+          scripts = [pathlib.Path('run-tests-original').resolve(), pathlib.Path('source/ci/tools/run-tests').resolve()]
+          with tempfile.TemporaryDirectory() as tmp:
+              root = pathlib.Path(tmp)
+              for name in ('cuda_pathfinder', 'cuda_bindings', 'cuda_core', 'bin'):
+                  (root / name).mkdir()
+              for name in ('cuda_pathfinder', 'cuda_bindings', 'cuda_core'):
+                  (root / name / (name + '-0.0.0-py3-none-any.whl')).touch()
+              pip = root / 'bin' / 'pip'
+              pip.write_text('#!/usr/bin/env bash\npython -c \'import json,os,sys; open(os.environ["PIP_LOG"],"a").write(json.dumps(sys.argv[1:])+"\\n")\' "$@"\nif [[ "$1" == "show" ]]; then echo "Version: 0.4.1"; fi\n')
+              pip.chmod(0o755)
+              cases = 0
+              changed = 0
+              for cuda, mode, bindings, local in itertools.product(
+                  ('12.9.1', '13.3.0'),
+                  ('nightly-numba-cuda-mlir', 'nightly-numba-cuda', 'nightly-pytorch'),
+                  ('main', 'published'), ('0', '1')
+              ):
+                  env = dict(os.environ, PATH=str(root/'bin')+os.pathsep+os.environ['PATH'],
+                      PIP_LOG=str(root/'pip.jsonl'), CUDA_VER=cuda,
+                      CUDA_BINDINGS_ARTIFACTS_DIR=(root/'cuda_bindings').as_posix(),
+                      CUDA_CORE_ARTIFACTS_DIR=(root/'cuda_core').as_posix(),
+                      BINDINGS_SOURCE=bindings, LOCAL_CTK=local,
+                      TEST_CUDA_MINOR=cuda.split('.')[1], TORCH_VER='latest', TORCH_CUDA='cu'+cuda.split('.')[0],
+                      GITHUB_ENV=str(root/'github-env'))
+                  outputs = []
+                  for script in scripts:
+                      (root/'pip.jsonl').write_text('')
+                      p = subprocess.run(['bash', script.as_posix(), mode], cwd=root, env=env, text=True, capture_output=True)
+                      assert p.returncode == 0, (cuda, mode, bindings, local, p.stdout, p.stderr)
+                      outputs.append([json.loads(line) for line in (root/'pip.jsonl').read_text().splitlines()])
+                  expected = outputs[0]
+                  if mode == 'nightly-numba-cuda-mlir':
+                      assert sum(args.count('numpy<2.5') for args in expected) == 1
+                      expected = [[a for a in args if a != 'numpy<2.5'] for args in expected]
+                      changed += 1
+                  assert outputs[1] == expected, (cuda, mode, bindings, local, outputs)
+                  cases += 1
+              print(f'{cases} install-path comparisons passed; only {changed} MLIR configurations changed')
+          PY
+      - name: Verify current NumPy and MLIR import compatibility
+        shell: bash
+        run: |
+          python -m pip install 'numpy>=2.5' 'numba-cuda-mlir>=0.4.1' packaging
+          python -m pip check
+          python - <<'PY'
+          import importlib.metadata as md
+          import numpy as np
+          from packaging.version import Version
+          assert Version(np.__version__) >= Version('2.5')
+          assert Version(md.version('numba-cuda-mlir')) >= Version('0.4.1')
+          assert not hasattr(np, 'row_stack')
+          from numba_cuda_mlir import cuda
+          print('NumPy:', np.__version__)
+          print('Numba-CUDA-MLIR:', md.version('numba-cuda-mlir'))
+          print('CUDA module import passed without np.row_stack')
+          PY
+          python -m pip list
