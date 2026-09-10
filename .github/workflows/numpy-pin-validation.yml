@@ -6,15 +6,6 @@ on:
 permissions:
   contents: read
 jobs:
-  cancel-superseded-validation:
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Stop the superseded full-checkout validation
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh run cancel 34508589470 --repo sylvesterkaczmarek/SkillSpector
   numpy:
     strategy:
       fail-fast: false
@@ -53,9 +44,16 @@ jobs:
       - name: Compare actual install arguments for all optional nightly modes
         shell: bash
         run: |
+          if command -v cygpath >/dev/null; then
+            export VALIDATION_BASH="$(cygpath -w "$BASH")"
+          else
+            export VALIDATION_BASH="$BASH"
+          fi
           python - <<'PY'
           import itertools, json, os, pathlib, subprocess, tempfile
           scripts = [pathlib.Path('artifacts/run-tests-original').resolve(), pathlib.Path('source/ci/tools/run-tests').resolve()]
+          bash = os.environ['VALIDATION_BASH']
+          assert pathlib.Path(bash).is_file(), bash
           with tempfile.TemporaryDirectory() as tmp:
               root = pathlib.Path(tmp)
               for name in ('cuda_pathfinder', 'cuda_bindings', 'cuda_core', 'bin'):
@@ -82,7 +80,7 @@ jobs:
                   outputs = []
                   for script in scripts:
                       (root/'pip.jsonl').write_text('')
-                      p = subprocess.run(['bash', script.as_posix(), mode], cwd=root, env=env, text=True, capture_output=True, timeout=30)
+                      p = subprocess.run([bash, script.as_posix(), mode], cwd=root, env=env, text=True, capture_output=True, timeout=30)
                       assert p.returncode == 0, (cuda, mode, bindings, local, p.stdout, p.stderr)
                       outputs.append([json.loads(line) for line in (root/'pip.jsonl').read_text().splitlines()])
                   expected = outputs[0]
@@ -99,7 +97,7 @@ jobs:
       - name: Verify published NumPy and MLIR import compatibility
         shell: bash
         run: |
-          python -m pip install 'numpy>=2.5' 'numba-cuda-mlir>=0.4.1' packaging
+          python -m pip install 'numpy>=2.5' 'numba-cuda-mlir[cu13]>=0.4.1' packaging
           python -m pip check
           python - <<'PY'
           import importlib.metadata as md
